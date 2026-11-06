@@ -1,0 +1,607 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, collection, query, onSnapshot, addDoc, orderBy, deleteDoc } from 'firebase/firestore';
+import { Activity, Dumbbell, Utensils, CheckSquare, Camera, ChevronRight, Flame, Droplet, Clock, Zap, Target, Trash2, Bell, BellRing, Plus, Minus } from 'lucide-react';
+
+// --- Firebase Setup ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+    apiKey: "dummy-key",
+    authDomain: "dummy-domain",
+    projectId: "dummy-project",
+    storageBucket: "dummy-bucket",
+    messagingSenderId: "dummy-sender",
+    appId: "dummy-appid"
+};
+
+let app, auth, db;
+try {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+} catch (e) {
+    console.error("Firebase init error:", e);
+}
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// --- Image Resizer Utility for Firestore Limits ---
+// Firestore has a 1MB limit per document. We resize images before saving them as Base64 strings.
+const resizeImage = (file) => {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = (event) => {
+            const img = new Image();
+            img.src = event.target.result;
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                const MAX_WIDTH = 800;
+                const MAX_HEIGHT = 800;
+                let width = img.width;
+                let height = img.height;
+
+                if (width > height) {
+                    if (width > MAX_WIDTH) {
+                        height *= MAX_WIDTH / width;
+                        width = MAX_WIDTH;
+                    }
+                } else {
+                    if (height > MAX_HEIGHT) {
+                        width *= MAX_HEIGHT / height;
+                        height = MAX_HEIGHT;
+                    }
+                }
+                canvas.width = width;
+                canvas.height = height;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+                resolve(canvas.toDataURL('image/jpeg', 0.6)); // 60% quality jpeg
+            };
+        };
+    });
+};
+
+export default function App() {
+    const [user, setUser] = useState(null);
+    const [activeTab, setActiveTab] = useState('dashboard');
+    const [loading, setLoading] = useState(true);
+
+    // Planner State
+    const [tasks, setTasks] = useState({
+        daily: {
+            water: false,
+            protein: false,
+            carnitine: false,
+            workout: false,
+            steps: false
+        },
+        weekly: {
+            workouts: false,
+            calories: false
+        },
+        waterTracker: {
+            count: 0,
+            reminder: false
+        }
+    });
+
+    // Progress Photos State
+    const [photos, setPhotos] = useState([]);
+    const [uploading, setUploading] = useState(false);
+
+    // Auth Effect
+    useEffect(() => {
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth error:", err);
+            }
+        };
+        initAuth();
+
+        const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+            setUser(currentUser);
+            setLoading(false);
+        });
+        return () => unsubscribe();
+    }, []);
+
+    // Fetch/Sync Planner Data
+    useEffect(() => {
+        if (!user) return;
+        const plannerRef = doc(db, 'artifacts', appId, 'users', user.uid, 'planner', 'state');
+        
+        const unsubscribe = onSnapshot(plannerRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                if (!data.waterTracker) data.waterTracker = { count: 0, reminder: false };
+                setTasks(data);
+            } else {
+                // Initialize default tasks if none exist
+                setDoc(plannerRef, tasks);
+            }
+        }, (error) => {
+            console.error("Planner sync error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    // Fetch/Sync Photos
+    useEffect(() => {
+        if (!user) return;
+        
+        const photosRef = collection(db, 'artifacts', appId, 'users', user.uid, 'progress_photos');
+        // Note: Not using orderBy here to comply with strict RULE 2 (no complex queries). 
+        // We will sort in memory.
+        const unsubscribe = onSnapshot(photosRef, (snapshot) => {
+            const fetchedPhotos = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            // Sort in memory by date descending
+            fetchedPhotos.sort((a, b) => b.timestamp - a.timestamp);
+            setPhotos(fetchedPhotos);
+        }, (error) => {
+            console.error("Photos sync error:", error);
+        });
+
+        return () => unsubscribe();
+    }, [user]);
+
+    const toggleTask = async (type, key) => {
+        if (!user) return;
+        const newTasks = {
+            ...tasks,
+            [type]: {
+                ...tasks[type],
+                [key]: !tasks[type][key]
+            }
+        };
+        setTasks(newTasks); // Optimistic UI update
+        const plannerRef = doc(db, 'artifacts', appId, 'users', user.uid, 'planner', 'state');
+        await setDoc(plannerRef, newTasks, { merge: true });
+    };
+
+    const handlePhotoUpload = async (e) => {
+        if (!user || !e.target.files || e.target.files.length === 0) return;
+        setUploading(true);
+        try {
+            const file = e.target.files[0];
+            const resizedBase64 = await resizeImage(file);
+            
+            const photosRef = collection(db, 'artifacts', appId, 'users', user.uid, 'progress_photos');
+            await addDoc(photosRef, {
+                imageUrl: resizedBase64,
+                timestamp: Date.now(),
+                dateStr: new Date().toLocaleDateString('en-GB')
+            });
+        } catch (error) {
+            console.error("Upload failed", error);
+        }
+        setUploading(false);
+    };
+
+    const deletePhoto = async (id) => {
+        if (!user) return;
+        try {
+            const photoRef = doc(db, 'artifacts', appId, 'users', user.uid, 'progress_photos', id);
+            await deleteDoc(photoRef);
+        } catch (error) {
+            console.error("Delete failed", error);
+        }
+    };
+
+    const resetDailyTasks = async () => {
+        if (!user) return;
+        const newTasks = {
+            ...tasks,
+            daily: {
+                water: false, protein: false, carnitine: false, workout: false, steps: false
+            },
+            waterTracker: {
+                ...tasks.waterTracker,
+                count: 0
+            }
+        };
+        const plannerRef = doc(db, 'artifacts', appId, 'users', user.uid, 'planner', 'state');
+        await setDoc(plannerRef, newTasks, { merge: true });
+    };
+
+    const updateWater = async (action) => {
+        if (!user) return;
+        let newCount = tasks.waterTracker?.count || 0;
+        let newReminder = tasks.waterTracker?.reminder || false;
+
+        if (action === 'add' && newCount < 16) newCount++;
+        if (action === 'sub' && newCount > 0) newCount--;
+        if (action === 'toggleReminder') newReminder = !newReminder;
+
+        const newTasks = {
+            ...tasks,
+            waterTracker: { count: newCount, reminder: newReminder }
+        };
+        setTasks(newTasks);
+        const plannerRef = doc(db, 'artifacts', appId, 'users', user.uid, 'planner', 'state');
+        await setDoc(plannerRef, newTasks, { merge: true });
+    };
+
+    if (loading) return <div className="min-h-screen bg-[#0B1121] flex items-center justify-center text-cyan-400 font-bold text-xl">Loading Srihari's Dashboard...</div>;
+
+    const navItems = [
+        { id: 'dashboard', icon: Activity, label: 'Overview' },
+        { id: 'diet', icon: Utensils, label: 'Diet Plan' },
+        { id: 'workout', icon: Dumbbell, label: 'Workouts' },
+        { id: 'planner', icon: CheckSquare, label: 'Planner' },
+        { id: 'progress', icon: Camera, label: 'Progress' },
+    ];
+
+    return (
+        <div className="min-h-screen bg-[#0B1121] text-slate-200 font-sans pb-28 md:pb-8 md:pl-20 selection:bg-cyan-500/30">
+            
+            {/* Mobile Bottom Nav */}
+            <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-[#0F172A]/95 border-t border-slate-800/80 z-50 flex justify-around px-2 pt-3 pb-6 backdrop-blur-xl shadow-[0_-10px_40px_rgba(0,0,0,0.5)]">
+                {navItems.map(item => (
+                    <button key={item.id} onClick={() => setActiveTab(item.id)} className={`flex flex-col items-center p-2 rounded-xl transition-all duration-300 w-16 ${activeTab === item.id ? 'text-cyan-400 bg-cyan-400/10' : 'text-slate-500 hover:text-slate-300'}`}>
+                        <item.icon size={24} className={activeTab === item.id ? 'animate-bounce-slight' : ''} />
+                        <span className="text-[10px] mt-1.5 font-bold tracking-wide">{item.label}</span>
+                    </button>
+                ))}
+            </nav>
+
+            {/* Desktop Side Nav */}
+            <nav className="hidden md:flex fixed top-0 left-0 bottom-0 w-20 bg-[#0F172A] border-r border-slate-800/80 flex-col items-center py-8 gap-8 z-50 shadow-2xl">
+                <div className="w-12 h-12 bg-cyan-400 rounded-full flex items-center justify-center text-[#0B1121] font-black text-xl mb-4 shadow-[0_0_15px_rgba(34,211,238,0.4)]">S</div>
+                {navItems.map(item => (
+                    <button key={item.id} onClick={() => setActiveTab(item.id)} className={`p-3 rounded-xl transition-all duration-300 group relative ${activeTab === item.id ? 'bg-cyan-400/20 text-cyan-400 shadow-[inset_0_0_10px_rgba(34,211,238,0.2)]' : 'text-slate-500 hover:bg-slate-800/50 hover:text-slate-300'}`}>
+                        <item.icon size={28} />
+                        <span className="absolute left-16 bg-[#1E293B] text-white px-3 py-1 rounded-md text-sm font-semibold opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap shadow-lg border border-slate-700">
+                            {item.label}
+                        </span>
+                    </button>
+                ))}
+            </nav>
+
+            {/* Main Content Area */}
+            <main className="p-4 md:p-8 max-w-5xl mx-auto">
+                
+                {/* --- DASHBOARD TAB --- */}
+                {activeTab === 'dashboard' && (
+                    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <header className="mb-6 md:mb-8 mt-2 md:mt-0">
+                            <h1 className="text-4xl md:text-5xl font-black text-white tracking-tight">Crush it today, <br className="md:hidden" /><span className="text-cyan-400 drop-shadow-[0_0_10px_rgba(34,211,238,0.5)]">Srihari</span>.</h1>
+                            <p className="text-slate-400 mt-2 text-base md:text-lg">Your premium fitness command center.</p>
+                        </header>
+
+                        <div className="grid lg:grid-cols-3 gap-6">
+                            {/* Macros Widget */}
+                            <div className="lg:col-span-2 bg-gradient-to-br from-[#1E293B] to-[#0F172A] rounded-3xl p-5 md:p-8 border border-slate-700/50 shadow-2xl relative overflow-hidden">
+                                <div className="absolute top-[-50px] right-[-50px] w-48 h-48 bg-cyan-500/10 rounded-full blur-3xl"></div>
+                                
+                                <h2 className="text-yellow-400 font-bold tracking-wider text-xs md:text-sm mb-2 md:mb-3 flex items-center gap-2 uppercase">
+                                    <Target size={18} /> Daily Target
+                                </h2>
+                                <div className="flex items-baseline gap-2 mb-6 md:mb-8">
+                                    <span className="text-6xl md:text-8xl font-black text-white tracking-tighter drop-shadow-md">2,230</span>
+                                    <span className="text-slate-400 font-medium text-lg md:text-xl">kcal</span>
+                                </div>
+
+                                <div className="grid grid-cols-3 gap-2 md:gap-6">
+                                    <div className="bg-[#0B1121]/50 rounded-2xl p-3 md:p-5 border border-slate-700/50 backdrop-blur-sm flex flex-col justify-center">
+                                        <div className="text-cyan-400 text-[10px] md:text-sm font-bold mb-1 md:mb-2 flex items-center gap-1 md:gap-1.5 uppercase tracking-wide"><div className="w-1.5 h-1.5 md:w-2 md:h-2 rounded-full bg-cyan-400 shadow-[0_0_5px_rgba(34,211,238,0.8)]"></div> Protein</div>
+                                        <div className="text-xl md:text-3xl font-black text-white">207 <span className="text-xs md:text-base text-slate-500 font-medium">g</span></div>
+                                    </div>
+                                    <div className="bg-[#0B1121]/50 rounded-2xl p-3 md:p-5 border border-slate-700/50 backdrop-blur-sm flex flex-col justify-center">
+                                        <div className="text-yellow-400 text-[10px] md:text-sm font-bold mb-1 md:mb-2 flex items-center gap-1 md:gap-1.5 uppercase tracking-wide"><div className="w-1.5 h-1.5 md:w-2 md:h-2 rounded-full bg-yellow-400 shadow-[0_0_5px_rgba(250,204,21,0.8)]"></div> Carbs</div>
+                                        <div className="text-xl md:text-3xl font-black text-white">211 <span className="text-xs md:text-base text-slate-500 font-medium">g</span></div>
+                                    </div>
+                                    <div className="bg-[#0B1121]/50 rounded-2xl p-3 md:p-5 border border-slate-700/50 backdrop-blur-sm flex flex-col justify-center">
+                                        <div className="text-pink-400 text-[10px] md:text-sm font-bold mb-1 md:mb-2 flex items-center gap-1 md:gap-1.5 uppercase tracking-wide"><div className="w-1.5 h-1.5 md:w-2 md:h-2 rounded-full bg-pink-400 shadow-[0_0_5px_rgba(244,114,182,0.8)]"></div> Fat</div>
+                                        <div className="text-xl md:text-3xl font-black text-white">62 <span className="text-xs md:text-base text-slate-500 font-medium">g</span></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* Water Tracker Widget */}
+                            <div className={`lg:col-span-1 bg-[#1E293B] rounded-3xl p-6 border transition-all duration-500 flex flex-col shadow-2xl relative overflow-hidden ${tasks.waterTracker?.reminder && (tasks.waterTracker?.count || 0) < 16 ? 'border-cyan-500/60 shadow-[0_0_20px_rgba(34,211,238,0.15)] animate-pulse' : 'border-slate-700/50'}`}>
+                                <div className="flex justify-between items-start mb-6 z-10 relative">
+                                    <div>
+                                        <h3 className="font-bold text-xl text-white flex items-center gap-2"><Droplet className="text-cyan-400"/> Hydration</h3>
+                                        <p className="text-slate-400 text-xs mt-1">Goal: 4L (16 x 250ml)</p>
+                                    </div>
+                                    <button onClick={() => updateWater('toggleReminder')} className={`p-2.5 rounded-xl transition-all duration-300 ${tasks.waterTracker?.reminder ? 'bg-cyan-400/20 text-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.2)]' : 'bg-[#0B1121] text-slate-500 hover:text-slate-300'}`} title="Toggle Reminder">
+                                        {tasks.waterTracker?.reminder ? <BellRing size={20} /> : <Bell size={20} />}
+                                    </button>
+                                </div>
+
+                                <div className="flex-1 flex flex-col justify-center z-10 relative">
+                                    <div className="text-center mb-6">
+                                        <span className="text-5xl font-black text-white tracking-tighter">{tasks.waterTracker?.count || 0}</span>
+                                        <span className="text-slate-400 text-lg font-medium ml-1">/ 16</span>
+                                    </div>
+
+                                    <div className="h-4 bg-[#0B1121] rounded-full overflow-hidden mb-6 border border-slate-700 shadow-inner">
+                                        <div className="h-full bg-gradient-to-r from-blue-500 to-cyan-400 transition-all duration-1000 ease-out relative" style={{ width: `${((tasks.waterTracker?.count || 0) / 16) * 100}%` }}>
+                                            <div className="absolute inset-0 bg-white/20 animate-pulse"></div>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-4">
+                                        <button onClick={() => updateWater('sub')} className="flex-1 py-4 md:py-3 bg-[#0B1121] rounded-xl hover:bg-slate-800 text-slate-300 font-bold flex justify-center border border-slate-700 transition-colors active:scale-95"><Minus size={24}/></button>
+                                        <button onClick={() => updateWater('add')} className="flex-1 py-4 md:py-3 bg-cyan-400 rounded-xl hover:bg-cyan-300 text-[#0B1121] font-black flex justify-center shadow-[0_0_15px_rgba(34,211,238,0.4)] transition-all transform hover:scale-105 active:scale-95"><Plus size={24}/></button>
+                                    </div>
+                                </div>
+                                {/* Water background graphic */}
+                                <Droplet size={150} className="absolute -bottom-10 -right-10 text-cyan-500/5 rotate-12 pointer-events-none" />
+                            </div>
+                        </div>
+
+                        <div className="grid md:grid-cols-2 gap-6">
+                            <div className="bg-[#1E293B] rounded-3xl p-6 border border-slate-700/50 shadow-xl">
+                                <h3 className="font-bold text-lg mb-4 text-white flex items-center gap-2"><Activity className="text-yellow-400"/> Current Stats</h3>
+                                <ul className="space-y-3 text-slate-300">
+                                    <li className="flex justify-between items-center bg-[#0B1121]/50 p-4 rounded-xl border border-slate-800"><span className="text-sm text-slate-400 font-medium">Weight</span> <span className="font-black text-lg">115 kg</span></li>
+                                    <li className="flex justify-between items-center bg-[#0B1121]/50 p-4 rounded-xl border border-slate-800"><span className="text-sm text-slate-400 font-medium">Height</span> <span className="font-black text-lg">6 ft</span></li>
+                                </ul>
+                            </div>
+                            <div className="bg-gradient-to-r from-[#1E293B] to-[#1e293b]/80 rounded-3xl p-6 border border-yellow-400/20 shadow-xl flex flex-col justify-center relative overflow-hidden">
+                                <div className="absolute top-0 right-0 w-32 h-32 bg-yellow-400/5 rounded-full blur-2xl pointer-events-none"></div>
+                                <h3 className="font-bold text-lg mb-3 text-white flex items-center gap-2"><Zap className="text-yellow-400 fill-yellow-400/20"/> L-Carnitine Protocol</h3>
+                                <p className="text-slate-300 text-sm leading-relaxed mb-5">
+                                    Take Fast&Up L-Carnitine 2000mg <strong className="text-yellow-400">30-45 minutes before</strong> training. Maximizes fat mobilization when heart rate is elevated.
+                                </p>
+                                <button onClick={() => setActiveTab('workout')} className="mt-auto flex items-center justify-center gap-2 w-full py-3 bg-yellow-400/10 text-yellow-400 border border-yellow-400/20 font-bold rounded-xl hover:bg-yellow-400 hover:text-[#0B1121] transition-all duration-300">
+                                    Start Workout <ChevronRight size={18}/>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* --- DIET PLAN TAB --- */}
+                {activeTab === 'diet' && (
+                    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <header className="mb-8">
+                            <h2 className="text-3xl md:text-5xl font-black text-white">Budget Diet Plan</h2>
+                            <p className="text-cyan-400 mt-2 font-medium">Tamil Nadu Local • High Protein • Low Cost</p>
+                        </header>
+
+                        <div className="space-y-4">
+                            {[
+                                { title: "Breakfast", protein: "~35g", items: ["4 Egg Whites + 2 Whole Eggs (Masala Omelette)", "3 Idlis OR 2 Dosas", "Sambar (Skip coconut chutney to save fat)"], icon: "🍳" },
+                                { title: "Lunch", protein: "~85g", items: ["250g Chicken Breast (Dry Chettinad roast or low-oil chilli chicken)", "1 to 1.5 cups cooked white rice", "Keerai (Spinach) or Cucumber salad"], icon: "🍛" },
+                                { title: "Pre-Workout", protein: "~26g", items: ["50g Soya Chunks (Meal Maker) dry-fried with pepper & onions", "Take Fast&Up L-Carnitine 2000mg 30 mins before training"], icon: "⚡" },
+                                { title: "Dinner", protein: "~52g", items: ["100g Soya Chunks cooked into a thick kurma", "2 to 3 dry Chapatis or Dosas"], icon: "🥘" },
+                                { title: "Before Bed", protein: "~8g", items: ["1 small cup (200ml) skimmed milk or low-fat curd (thayir)"], icon: "🥛" },
+                            ].map((meal, idx) => (
+                                <div key={idx} className="bg-[#1E293B] border border-slate-700/50 rounded-2xl p-6 hover:border-cyan-400/40 transition-colors shadow-lg group">
+                                    <div className="flex flex-wrap justify-between items-center mb-4 gap-3">
+                                        <h3 className="font-black text-xl text-white flex items-center gap-3"><span className="text-2xl bg-[#0B1121] p-2 rounded-xl border border-slate-800">{meal.icon}</span> {meal.title}</h3>
+                                        <span className="bg-cyan-400/10 text-cyan-400 border border-cyan-400/20 px-4 py-1.5 rounded-full text-sm font-bold uppercase tracking-wider">{meal.protein} Protein</span>
+                                    </div>
+                                    <ul className="space-y-3 pl-2">
+                                        {meal.items.map((item, i) => (
+                                            <li key={i} className="text-slate-300 text-sm md:text-base flex items-start gap-3">
+                                                <div className="min-w-2 w-2 h-2 rounded-full bg-cyan-400 mt-2 shadow-[0_0_5px_rgba(34,211,238,0.8)]"></div>
+                                                <span className="leading-relaxed" dangerouslySetInnerHTML={{ __html: item.replace('Fast&Up L-Carnitine 2000mg', '<span class="text-yellow-400 font-bold bg-yellow-400/10 px-1 rounded">Fast&Up L-Carnitine 2000mg</span>') }} />
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            ))}
+                        </div>
+                        
+                        <div className="bg-yellow-400/10 border border-yellow-400/30 p-5 rounded-2xl flex gap-4 items-start mt-6 shadow-lg shadow-yellow-400/5">
+                            <Flame className="text-yellow-400 shrink-0 mt-1" size={24} />
+                            <div>
+                                <h4 className="font-black text-yellow-400 mb-1 text-lg">Crucial Rule: Oil Limit</h4>
+                                <p className="text-slate-300 text-sm md:text-base leading-relaxed">Keep cooking oil to a strict minimum (<strong className="text-white">1-2 tablespoons for the entire day</strong>). This is the only way to ensure you do not exceed your 62g daily fat limit while eating home-cooked meals.</p>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* --- WORKOUT TAB --- */}
+                {activeTab === 'workout' && (
+                    <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <header>
+                            <h2 className="text-3xl md:text-5xl font-black text-white">Visual Workout Plan</h2>
+                            <p className="text-cyan-400 mt-2 font-medium">4 Days/Week • 2 Dumbbells Only</p>
+                        </header>
+
+                        {/* Workout A Grid */}
+                        <div>
+                            <div className="flex items-center gap-4 mb-6">
+                                <h3 className="font-black text-2xl text-white">Workout A</h3>
+                                <span className="text-xs font-bold uppercase tracking-wider text-cyan-400 bg-cyan-400/10 border border-cyan-400/20 px-3 py-1 rounded-full">Upper Body</span>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                                {[
+                                    { name: "Push-ups", sets: "3", reps: "to failure", note: "On knees if standard is too hard", img: "https://images.unsplash.com/photo-1598971639058-fab3c3109a00?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB Floor Press", sets: "4", reps: "10-12", note: "Lie on floor, press up like bench", img: "https://images.unsplash.com/photo-1581009146145-b5ef050c2e1e?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB Bent-Over Rows", sets: "4", reps: "10-12", note: "Pull-up replacement. Keep back straight.", img: "https://images.unsplash.com/photo-1534438327276-14e5300c3a48?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB Shoulder Press", sets: "3", reps: "10-12", note: "Push weights overhead safely", img: "https://images.unsplash.com/photo-1541534741688-6078c6bfb5c5?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB Floor Pullovers", sets: "3", reps: "12", note: "Lie flat, lower one DB behind head", img: "https://images.unsplash.com/photo-1571019614242-c5c5dee9f50b?auto=format&fit=crop&w=300&q=80" }
+                                ].map((ex, i) => (
+                                    <div key={i} className="group bg-[#1E293B] rounded-2xl border border-slate-700/50 overflow-hidden hover:border-cyan-400/50 transition-all hover:shadow-[0_10px_30px_rgba(34,211,238,0.15)] hover:-translate-y-1">
+                                        <div className="h-40 overflow-hidden relative">
+                                            <img src={ex.img} alt={ex.name} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700 ease-in-out opacity-60 mix-blend-luminosity group-hover:mix-blend-normal group-hover:opacity-100" />
+                                            <div className="absolute inset-0 bg-gradient-to-t from-[#1E293B] to-transparent"></div>
+                                            <div className="absolute bottom-3 left-4 flex gap-2">
+                                                <span className="bg-[#0B1121]/80 backdrop-blur text-cyan-400 font-black text-xs px-2 py-1 rounded border border-cyan-400/20">{ex.sets} SETS</span>
+                                                <span className="bg-[#0B1121]/80 backdrop-blur text-yellow-400 font-black text-xs px-2 py-1 rounded border border-yellow-400/20">{ex.reps}</span>
+                                            </div>
+                                        </div>
+                                        <div className="p-4 pt-2">
+                                            <h4 className="font-bold text-white text-lg mb-1">{ex.name}</h4>
+                                            <p className="text-xs text-slate-400 leading-relaxed">{ex.note}</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Workout B Grid */}
+                        <div>
+                            <div className="flex items-center gap-4 mb-6">
+                                <h3 className="font-black text-2xl text-white">Workout B</h3>
+                                <span className="text-xs font-bold uppercase tracking-wider text-yellow-400 bg-yellow-400/10 border border-yellow-400/20 px-3 py-1 rounded-full">Lower & Core</span>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                                {[
+                                    { name: "Goblet Squats", sets: "4", reps: "12-15", note: "Hold one dumbbell at chest, squat deep", img: "https://images.unsplash.com/photo-1566241440091-ec10de8db2e1?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB RDLs", sets: "4", reps: "10-12", note: "Romanian Deadlift. Hinge at hips.", img: "https://images.unsplash.com/photo-1574680096145-d05b474e2155?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "DB Lunges", sets: "3", reps: "10/leg", note: "Step forward, drop back knee", img: "https://images.unsplash.com/photo-1434596922112-19c563067271?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "Planks", sets: "3", reps: "45-60s", note: "Keep core tight and back flat", img: "https://images.unsplash.com/photo-1571019613454-1cb2f99b2d8b?auto=format&fit=crop&w=300&q=80" },
+                                    { name: "Floor Crunches", sets: "3", reps: "15-20", note: "Basic abdominal crunches", img: "https://images.unsplash.com/photo-1517836357463-d25dfeac3438?auto=format&fit=crop&w=300&q=80" }
+                                ].map((ex, i) => (
+                                    <div key={i} className="group bg-[#1E293B] rounded-2xl border border-slate-700/50 overflow-hidden hover:border-yellow-400/50 transition-all hover:shadow-[0_10px_30px_rgba(250,204,21,0.1)] hover:-translate-y-1">
+                                        <div className="h-40 overflow-hidden relative">
+                                            <img src={ex.img} alt={ex.name} className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700 ease-in-out opacity-60 mix-blend-luminosity group-hover:mix-blend-normal group-hover:opacity-100" />
+                                            <div className="absolute inset-0 bg-gradient-to-t from-[#1E293B] to-transparent"></div>
+                                            <div className="absolute bottom-3 left-4 flex gap-2">
+                                                <span className="bg-[#0B1121]/80 backdrop-blur text-yellow-400 font-black text-xs px-2 py-1 rounded border border-yellow-400/20">{ex.sets} SETS</span>
+                                                <span className="bg-[#0B1121]/80 backdrop-blur text-cyan-400 font-black text-xs px-2 py-1 rounded border border-cyan-400/20">{ex.reps}</span>
+                                            </div>
+                                        </div>
+                                        <div className="p-4 pt-2">
+                                            <h4 className="font-bold text-white text-lg mb-1">{ex.name}</h4>
+                                            <p className="text-xs text-slate-400 leading-relaxed">{ex.note}</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* --- PLANNER TAB --- */}
+                {activeTab === 'planner' && (
+                    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <header className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+                            <div>
+                                <h2 className="text-3xl md:text-5xl font-black text-white">Target Planner</h2>
+                                <p className="text-slate-400 mt-2">Check these off to guarantee results.</p>
+                            </div>
+                            <button onClick={resetDailyTasks} className="text-xs font-bold uppercase tracking-wider text-slate-400 bg-[#1E293B] px-4 py-2.5 rounded-xl border border-slate-700 hover:text-white hover:border-slate-500 transition-colors shadow-sm">
+                                Reset Daily
+                            </button>
+                        </header>
+
+                        <div className="bg-[#1E293B] border border-slate-700/50 rounded-3xl p-4 sm:p-8 shadow-xl">
+                            <h3 className="font-black text-xl text-cyan-400 mb-4 md:mb-5 px-2 flex items-center gap-2"><Target size={22}/> Daily Objectives</h3>
+                            <div className="grid gap-3">
+                                {[
+                                    { id: 'water', label: "Drink 4 Liters of Water", icon: Droplet },
+                                    { id: 'protein', label: "Hit 207g Protein Target", icon: Utensils },
+                                    { id: 'carnitine', label: "Take L-Carnitine 30m Pre-Workout", icon: Zap },
+                                    { id: 'workout', label: "Complete 45-Min Workout", icon: Dumbbell },
+                                    { id: 'steps', label: "Walk 8,000 - 10,000 Steps", icon: Activity },
+                                ].map(task => (
+                                    <button 
+                                        key={task.id} 
+                                        onClick={() => toggleTask('daily', task.id)}
+                                        className={`w-full text-left p-4 md:p-5 min-h-[64px] rounded-2xl flex items-center gap-3 md:gap-4 transition-all duration-300 border active:scale-[0.98] ${
+                                            tasks.daily[task.id] 
+                                                ? 'bg-cyan-400/10 border-cyan-400/30 text-cyan-300' 
+                                                : 'bg-[#0B1121] border-slate-800 text-slate-300 hover:border-slate-600'
+                                        }`}
+                                    >
+                                        <div className={`shrink-0 w-6 h-6 md:w-7 md:h-7 rounded-lg flex items-center justify-center border-2 transition-all duration-300 ${
+                                            tasks.daily[task.id] ? 'bg-cyan-400 border-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.5)]' : 'border-slate-600'
+                                        }`}>
+                                            {tasks.daily[task.id] && <svg className="w-4 h-4 md:w-5 md:h-5 text-[#0B1121]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={4}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>}
+                                        </div>
+                                        <div className="flex items-center gap-3 md:gap-4 w-full">
+                                            <task.icon size={20} className={`shrink-0 ${tasks.daily[task.id] ? 'text-cyan-400' : 'text-slate-500'}`} />
+                                            <span className={`font-bold text-sm md:text-lg ${tasks.daily[task.id] ? 'line-through opacity-50' : ''}`}>{task.label}</span>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="bg-[#1E293B] border border-slate-700/50 rounded-3xl p-4 sm:p-8 shadow-xl">
+                            <h3 className="font-black text-xl text-yellow-400 mb-4 md:mb-5 px-2 flex items-center gap-2"><Flame size={22}/> Weekly Objectives</h3>
+                            <div className="grid gap-3">
+                                {[
+                                    { id: 'workouts', label: "Complete all 4 Workouts", icon: Dumbbell },
+                                    { id: 'calories', label: "Stay under 2,230 kcal all 7 days", icon: Target },
+                                ].map(task => (
+                                    <button 
+                                        key={task.id} 
+                                        onClick={() => toggleTask('weekly', task.id)}
+                                        className={`w-full text-left p-4 md:p-5 min-h-[64px] rounded-2xl flex items-center gap-3 md:gap-4 transition-all duration-300 border active:scale-[0.98] ${
+                                            tasks.weekly[task.id] 
+                                                ? 'bg-yellow-400/10 border-yellow-400/30 text-yellow-300' 
+                                                : 'bg-[#0B1121] border-slate-800 text-slate-300 hover:border-slate-600'
+                                        }`}
+                                    >
+                                        <div className={`shrink-0 w-6 h-6 md:w-7 md:h-7 rounded-lg flex items-center justify-center border-2 transition-all duration-300 ${
+                                            tasks.weekly[task.id] ? 'bg-yellow-400 border-yellow-400 shadow-[0_0_10px_rgba(250,204,21,0.5)]' : 'border-slate-600'
+                                        }`}>
+                                            {tasks.weekly[task.id] && <svg className="w-4 h-4 md:w-5 md:h-5 text-[#0B1121]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={4}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>}
+                                        </div>
+                                        <div className="flex items-center gap-3 md:gap-4 w-full">
+                                            <task.icon size={20} className={`shrink-0 ${tasks.weekly[task.id] ? 'text-yellow-400' : 'text-slate-500'}`} />
+                                            <span className={`font-bold text-sm md:text-lg ${tasks.weekly[task.id] ? 'line-through opacity-50' : ''}`}>{task.label}</span>
+                                        </div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* --- PROGRESS PHOTOS TAB --- */}
+                {activeTab === 'progress' && (
+                    <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <header className="mb-8 flex flex-col md:flex-row md:items-end justify-between gap-6">
+                            <div>
+                                <h2 className="text-3xl md:text-5xl font-black text-white">Physique Tracking</h2>
+                                <p className="text-cyan-400 mt-2 font-medium">Document the journey from 115kg to fit.</p>
+                            </div>
+                            
+                            <label className={`cursor-pointer bg-cyan-400 hover:bg-cyan-300 text-[#0B1121] font-black py-3 px-6 rounded-xl flex items-center justify-center gap-3 transition-all duration-300 shadow-[0_0_20px_rgba(34,211,238,0.3)] hover:scale-105 ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                                <Camera size={22} />
+                                {uploading ? 'UPLOADING...' : 'ADD NEW PHOTO'}
+                                <input type="file" accept="image/*" onChange={handlePhotoUpload} className="hidden" />
+                            </label>
+                        </header>
+
+                        {photos.length === 0 ? (
+                            <div className="bg-[#1E293B] border-2 border-dashed border-slate-700/50 rounded-3xl p-16 flex flex-col items-center justify-center text-center text-slate-500 shadow-inner">
+                                <Camera size={64} className="mb-6 opacity-30 text-cyan-400" />
+                                <h3 className="text-2xl font-black text-slate-300 mb-3">No photos yet</h3>
+                                <p className="max-w-sm text-base leading-relaxed text-slate-400">Upload your day one photo to start visualizing your transformation.</p>
+                            </div>
+                        ) : (
+                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
+                                {photos.map(photo => (
+                                    <div key={photo.id} className="relative group bg-[#0B1121] rounded-2xl overflow-hidden aspect-[3/4] border border-slate-700/50 shadow-xl hover:border-cyan-400/50 transition-colors">
+                                        <img src={photo.imageUrl} alt={`Progress on ${photo.dateStr}`} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                                        <div className="absolute inset-0 bg-gradient-to-t from-[#0B1121] via-transparent to-transparent opacity-90"></div>
+                                        <div className="absolute bottom-0 left-0 right-0 p-4">
+                                            <span className="font-bold text-cyan-400 text-sm bg-[#0B1121]/80 px-3 py-1.5 rounded-lg border border-cyan-400/20 backdrop-blur-md shadow-lg inline-block">{photo.dateStr}</span>
+                                        </div>
+                                        
+                                        <button 
+                                            onClick={() => deletePhoto(photo.id)}
+                                            className="absolute top-3 right-3 p-2.5 bg-red-500/80 text-white rounded-xl opacity-0 group-hover:opacity-100 transition-all hover:bg-red-500 hover:scale-110 backdrop-blur-sm shadow-lg"
+                                            title="Delete photo"
+                                        >
+                                            <Trash2 size={18} />
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </main>
+        </div>
+    );
+}
